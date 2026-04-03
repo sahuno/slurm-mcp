@@ -145,7 +145,8 @@ SINFO_FALLBACK=false
 
 if [ ${#USER_PARTITIONS[@]} -eq 0 ]; then
     # Fallback: show all cluster partitions via sinfo
-    echo "Could not determine partitions for account '$SLURM_ACCOUNT' via sacctmgr."
+    echo "Could not determine default partitions for account '$SLURM_ACCOUNT' via sacctmgr."
+    echo "  Falling back to sinfo to list all cluster partitions."
     echo ""
     if command -v sinfo &>/dev/null; then
         while IFS= read -r part; do
