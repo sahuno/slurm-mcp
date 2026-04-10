@@ -17,6 +17,9 @@ from slurm_mcp.slurm_cli import (
     SlurmConfig,
     _parse_mem_gb,
     _parse_time_hours,
+    _parse_exit_code,
+    _parse_rss_to_gb,
+    _format_time_hours,
     _validate_resources,
     submit_job,
     job_status,
@@ -26,6 +29,10 @@ from slurm_mcp.slurm_cli import (
     job_resources,
     queue_info,
     node_info,
+    diagnose_job,
+    JOB_STATE_INFO,
+    JOB_REASON_INFO,
+    SIGNAL_INFO,
 )
 
 
@@ -853,3 +860,320 @@ class TestPerPartitionValidation:
             gpu="6",
         )
         assert any("GPUs" in v and "componc_cpu" in v for v in violations)
+
+
+# ============================================================================
+# Error Code Interpreter Tests
+# ============================================================================
+
+
+class TestParseExitCode:
+    """Tests for _parse_exit_code (Level 1: exit code parsing)."""
+
+    def test_success(self):
+        result = _parse_exit_code("0:0")
+        assert result["exit_code"] == 0
+        assert result["signal_number"] == 0
+        assert "signal_name" not in result
+
+    def test_script_error(self):
+        result = _parse_exit_code("1:0")
+        assert result["exit_code"] == 1
+        assert result["signal_number"] == 0
+
+    def test_oom_sigkill(self):
+        result = _parse_exit_code("0:9")
+        assert result["exit_code"] == 0
+        assert result["signal_number"] == 9
+        assert result["signal_name"] == "SIGKILL"
+        assert "OOM" in result["signal_cause"] or "Force" in result["signal_cause"]
+
+    def test_sigterm(self):
+        result = _parse_exit_code("0:15")
+        assert result["signal_number"] == 15
+        assert result["signal_name"] == "SIGTERM"
+
+    def test_segfault(self):
+        result = _parse_exit_code("0:11")
+        assert result["signal_number"] == 11
+        assert result["signal_name"] == "SIGSEGV"
+
+    def test_unknown_signal(self):
+        result = _parse_exit_code("0:99")
+        assert result["signal_number"] == 99
+        assert result["signal_name"] == "SIG99"
+
+    def test_malformed_input(self):
+        result = _parse_exit_code("bad")
+        assert result["exit_code"] == -1
+        assert result["signal_number"] == 0
+
+    def test_command_not_found(self):
+        result = _parse_exit_code("127:0")
+        assert result["exit_code"] == 127
+
+    def test_permission_denied(self):
+        result = _parse_exit_code("126:0")
+        assert result["exit_code"] == 126
+
+
+class TestParseRssToGb:
+    """Tests for _parse_rss_to_gb (memory string parsing)."""
+
+    def test_kilobytes(self):
+        assert abs(_parse_rss_to_gb("1048576K") - 1.0) < 0.01  # 1 GB
+
+    def test_megabytes(self):
+        assert abs(_parse_rss_to_gb("1024M") - 1.0) < 0.01
+
+    def test_gigabytes(self):
+        assert _parse_rss_to_gb("64G") == 64.0
+
+    def test_terabytes(self):
+        assert _parse_rss_to_gb("1T") == 1024.0
+
+    def test_empty_string(self):
+        assert _parse_rss_to_gb("") is None
+
+    def test_invalid_string(self):
+        assert _parse_rss_to_gb("abc") is None
+
+
+class TestFormatTimeHours:
+    """Tests for _format_time_hours (hours to SLURM time string)."""
+
+    def test_simple_hours(self):
+        assert _format_time_hours(4.0) == "04:00:00"
+
+    def test_fractional_hours(self):
+        assert _format_time_hours(1.5) == "01:30:00"
+
+    def test_days(self):
+        assert _format_time_hours(48.0) == "2-00:00:00"
+
+    def test_large_time(self):
+        result = _format_time_hours(168.0)
+        assert result == "7-00:00:00"
+
+    def test_zero(self):
+        assert _format_time_hours(0) == "00:00:00"
+
+
+class TestLookupTables:
+    """Tests that lookup tables have required keys and cover common cases."""
+
+    def test_state_info_has_common_states(self):
+        for state in ["COMPLETED", "FAILED", "TIMEOUT", "OUT_OF_MEMORY",
+                       "CANCELLED", "NODE_FAIL", "PREEMPTED", "PENDING", "RUNNING"]:
+            assert state in JOB_STATE_INFO, f"Missing state: {state}"
+            assert "explanation" in JOB_STATE_INFO[state]
+            assert "severity" in JOB_STATE_INFO[state]
+            assert "action" in JOB_STATE_INFO[state]
+
+    def test_reason_info_has_common_reasons(self):
+        for reason in ["Priority", "Resources", "Dependency", "QOSMaxJobsPerUserLimit",
+                        "PartitionTimeLimit", "InvalidAccount", "BadConstraints"]:
+            assert reason in JOB_REASON_INFO, f"Missing reason: {reason}"
+            assert "explanation" in JOB_REASON_INFO[reason]
+            assert "action" in JOB_REASON_INFO[reason]
+
+    def test_signal_info_has_common_signals(self):
+        for sig in [9, 11, 15]:
+            assert sig in SIGNAL_INFO, f"Missing signal: {sig}"
+            assert "name" in SIGNAL_INFO[sig]
+            assert "cause" in SIGNAL_INFO[sig]
+
+    def test_severity_values_are_valid(self):
+        valid_severities = {"success", "error", "warning", "info"}
+        for state, info in JOB_STATE_INFO.items():
+            assert info["severity"] in valid_severities, (
+                f"State '{state}' has invalid severity: {info['severity']}"
+            )
+
+
+class TestDiagnoseJob:
+    """Tests for diagnose_job (Level 1 + Level 2 combined)."""
+
+    def _mock_sacct_output(self, state="FAILED", exit_code="1:0", max_rss="32000M",
+                           elapsed="02:15:33", name="test_job"):
+        """Build a mock sacct output line."""
+        # Format: JobID|JobName|State|ExitCode|Elapsed|MaxRSS|MaxVMSize|CPUTime|AveRSS|NNodes|NCPUS|TotalCPU
+        main_line = f"12345|{name}|{state}|{exit_code}|{elapsed}||||||4|8|"
+        batch_line = f"12345.batch|batch|{state}|{exit_code}|{elapsed}|{max_rss}|||||4|8|"
+        return f"{main_line}\n{batch_line}"
+
+    def _mock_scontrol_output(self, time_limit="04:00:00", mem="64G"):
+        """Build mock scontrol show job output."""
+        return (
+            f"JobId=12345 JobName=test_job\n"
+            f"   TimeLimit={time_limit} MinMemoryNode={mem}\n"
+            f"   NumCPUs=8 Partition=test_queue\n"
+        )
+
+    @patch("slurm_mcp.slurm_cli._run_cmd")
+    def test_diagnose_failed_exit_code_1(self, mock_run, config):
+        """FAILED with exit code 1:0 → script error explanation."""
+        mock_run.side_effect = [
+            # job_resources sacct call
+            MagicMock(returncode=0, stdout=self._mock_sacct_output(
+                state="FAILED", exit_code="1:0")),
+            # _compare_resources scontrol call
+            MagicMock(returncode=0, stdout=self._mock_scontrol_output()),
+        ]
+        result = diagnose_job("12345", config)
+        assert result["state"] == "FAILED"
+        assert result["severity"] == "error"
+        assert "exit code 1" in result["explanation"]
+        assert result["exit_code_info"]["exit_code"] == 1
+
+    @patch("slurm_mcp.slurm_cli._run_cmd")
+    def test_diagnose_oom(self, mock_run, config):
+        """OUT_OF_MEMORY → OOM explanation with memory comparison."""
+        mock_run.side_effect = [
+            # job_resources sacct call
+            MagicMock(returncode=0, stdout=self._mock_sacct_output(
+                state="OUT_OF_MEMORY", exit_code="0:9", max_rss="62000M")),
+            # _compare_resources scontrol call
+            MagicMock(returncode=0, stdout=self._mock_scontrol_output(mem="64G")),
+        ]
+        result = diagnose_job("12345", config)
+        assert result["state"] == "OUT_OF_MEMORY"
+        assert "memory" in result.get("resource_comparison", {})
+        assert "Increase" in result["suggested_action"]
+
+    @patch("slurm_mcp.slurm_cli._run_cmd")
+    def test_diagnose_timeout(self, mock_run, config):
+        """TIMEOUT → time comparison and suggestion to increase."""
+        mock_run.side_effect = [
+            # job_resources sacct call
+            MagicMock(returncode=0, stdout=self._mock_sacct_output(
+                state="TIMEOUT", exit_code="0:15", elapsed="04:00:00")),
+            # _compare_resources scontrol call
+            MagicMock(returncode=0, stdout=self._mock_scontrol_output(time_limit="04:00:00")),
+        ]
+        result = diagnose_job("12345", config)
+        assert result["state"] == "TIMEOUT"
+        assert "time" in result.get("resource_comparison", {})
+        assert "Increase --time" in result["suggested_action"]
+
+    @patch("slurm_mcp.slurm_cli._run_cmd")
+    def test_diagnose_sigkill(self, mock_run, config):
+        """FAILED with signal 9 → SIGKILL / OOM killer explanation."""
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout=self._mock_sacct_output(
+                state="FAILED", exit_code="0:9", max_rss="63500M")),
+            MagicMock(returncode=0, stdout=self._mock_scontrol_output(mem="64G")),
+        ]
+        result = diagnose_job("12345", config)
+        assert result["exit_code_info"]["signal_name"] == "SIGKILL"
+        assert "OOM" in result["explanation"] or "SIGKILL" in result["explanation"]
+
+    @patch("slurm_mcp.slurm_cli._run_cmd")
+    def test_diagnose_segfault(self, mock_run, config):
+        """FAILED with signal 11 → segfault explanation."""
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout=self._mock_sacct_output(
+                state="FAILED", exit_code="0:11")),
+            MagicMock(returncode=0, stdout=self._mock_scontrol_output()),
+        ]
+        result = diagnose_job("12345", config)
+        assert "segmentation fault" in result["explanation"].lower()
+        assert "debug" in result["suggested_action"].lower()
+
+    @patch("slurm_mcp.slurm_cli._run_cmd")
+    def test_diagnose_command_not_found(self, mock_run, config):
+        """FAILED with exit code 127 → command not found."""
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout=self._mock_sacct_output(
+                state="FAILED", exit_code="127:0")),
+            MagicMock(returncode=0, stdout=self._mock_scontrol_output()),
+        ]
+        result = diagnose_job("12345", config)
+        assert result["exit_code_info"]["exit_code"] == 127
+        assert "command not found" in result["explanation"].lower()
+
+    @patch("slurm_mcp.slurm_cli._run_cmd")
+    def test_diagnose_completed_success(self, mock_run, config):
+        """COMPLETED → success with no action needed."""
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout=self._mock_sacct_output(
+                state="COMPLETED", exit_code="0:0", max_rss="8000M", elapsed="01:30:00")),
+            MagicMock(returncode=0, stdout=self._mock_scontrol_output()),
+        ]
+        result = diagnose_job("12345", config)
+        assert result["state"] == "COMPLETED"
+        assert result["severity"] == "success"
+
+    @patch("slurm_mcp.slurm_cli._run_cmd")
+    def test_diagnose_no_sacct_data(self, mock_run, config):
+        """No sacct data → returns error."""
+        mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="")
+        result = diagnose_job("99999", config)
+        assert "error" in result
+
+    @patch("slurm_mcp.slurm_cli._run_cmd")
+    def test_diagnose_cancelled(self, mock_run, config):
+        """CANCELLED → warning severity."""
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout=self._mock_sacct_output(
+                state="CANCELLED", exit_code="0:0", elapsed="00:05:00")),
+            MagicMock(returncode=0, stdout=self._mock_scontrol_output()),
+        ]
+        result = diagnose_job("12345", config)
+        assert result["state"] == "CANCELLED"
+        assert result["severity"] == "warning"
+
+    @patch("slurm_mcp.slurm_cli._run_cmd")
+    def test_diagnose_node_fail(self, mock_run, config):
+        """NODE_FAIL → error with resubmit suggestion."""
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout=self._mock_sacct_output(
+                state="NODE_FAIL", exit_code="0:0", elapsed="01:00:00")),
+            MagicMock(returncode=0, stdout=self._mock_scontrol_output()),
+        ]
+        result = diagnose_job("12345", config)
+        assert result["state"] == "NODE_FAIL"
+        assert "Resubmit" in result["suggested_action"]
+
+    @patch("slurm_mcp.slurm_cli._run_cmd")
+    def test_resource_comparison_memory_warning(self, mock_run, config):
+        """High memory utilization (>90%) → warning in resource comparison."""
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout=self._mock_sacct_output(
+                state="COMPLETED", exit_code="0:0", max_rss="60000M")),
+            MagicMock(returncode=0, stdout=self._mock_scontrol_output(mem="64G")),
+        ]
+        result = diagnose_job("12345", config)
+        mem = result.get("resource_comparison", {}).get("memory", {})
+        assert mem.get("utilization", 0) > 0.9
+        assert "warning" in mem
+
+    @patch("slurm_mcp.slurm_cli._run_cmd")
+    def test_resource_comparison_low_time_usage(self, mock_run, config):
+        """Low time utilization (<10%) → note suggesting reduction."""
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout=self._mock_sacct_output(
+                state="COMPLETED", exit_code="0:0", elapsed="00:10:00")),
+            MagicMock(returncode=0, stdout=self._mock_scontrol_output(time_limit="04:00:00")),
+        ]
+        result = diagnose_job("12345", config)
+        time_comp = result.get("resource_comparison", {}).get("time", {})
+        assert time_comp.get("utilization", 1) < 0.1
+        assert "note" in time_comp
+
+    @patch("slurm_mcp.slurm_cli._run_cmd")
+    def test_diagnose_falls_back_to_sacct_for_requested(self, mock_run, config):
+        """When scontrol fails, falls back to sacct for requested resources."""
+        mock_run.side_effect = [
+            # job_resources sacct call
+            MagicMock(returncode=0, stdout=self._mock_sacct_output(
+                state="COMPLETED", exit_code="0:0")),
+            # scontrol fails (old job)
+            MagicMock(returncode=1, stdout="", stderr="Invalid job id"),
+            # sacct fallback for requested resources
+            MagicMock(returncode=0, stdout="04:00:00|64G|8\n04:00:00|64G|8\n"),
+        ]
+        result = diagnose_job("12345", config)
+        assert result["state"] == "COMPLETED"
+        # Should still have some resource comparison despite scontrol failure
+        assert "resource_comparison" in result

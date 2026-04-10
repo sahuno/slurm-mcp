@@ -11,6 +11,7 @@ Tools:
     slurm_job_logs      — Read stdout/stderr from a job
     slurm_cancel_job    — Cancel a running or pending job
     slurm_job_resources — Get resource usage for a completed job
+    slurm_diagnose_job  — Diagnose why a job failed with explanation and fix suggestions
     slurm_queue_info    — Show partition/queue availability
     slurm_submit_batch  — Submit multiple scripts at once
 
@@ -27,7 +28,7 @@ from typing import Optional
 from mcp.server.fastmcp import FastMCP
 
 from .slurm_cli import SlurmConfig, submit_job, job_status, list_jobs, job_logs
-from .slurm_cli import cancel_job, job_resources, queue_info, node_info
+from .slurm_cli import cancel_job, job_resources, queue_info, node_info, diagnose_job
 
 # All logging to stderr — stdout is reserved for MCP JSON-RPC protocol
 logging.basicConfig(
@@ -187,6 +188,21 @@ def slurm_job_resources(job_id: str) -> str:
     """Get resource usage (MaxRSS, CPU time, elapsed, exit_code) for a completed SLURM job."""
     try:
         result = job_resources(job_id=job_id)
+        return json.dumps(result)
+    except RuntimeError as e:
+        return json.dumps({"error": str(e)})
+
+
+# ============================================================================
+# Tool 7: Diagnose job failure
+# ============================================================================
+
+
+@mcp.tool()
+def slurm_diagnose_job(job_id: str) -> str:
+    """Diagnose why a SLURM job failed. Returns human-readable explanation, suggested fix, exit code analysis, and resource usage comparison (requested vs actual)."""
+    try:
+        result = diagnose_job(job_id=job_id, config=config)
         return json.dumps(result)
     except RuntimeError as e:
         return json.dumps({"error": str(e)})

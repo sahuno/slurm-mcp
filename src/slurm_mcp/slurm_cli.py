@@ -18,6 +18,218 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+# ============================================================================
+# Error code lookup tables (Level 1: static interpretation)
+# ============================================================================
+
+# Terminal job states -> explanation + suggested action
+JOB_STATE_INFO: dict[str, dict[str, str]] = {
+    "COMPLETED": {
+        "explanation": "Job finished successfully with exit code 0 on all nodes.",
+        "severity": "success",
+        "action": "",
+    },
+    "FAILED": {
+        "explanation": "Job terminated with a non-zero exit code.",
+        "severity": "error",
+        "action": "Check stderr logs (slurm_job_logs). Common causes: script error, missing module, bad input path.",
+    },
+    "TIMEOUT": {
+        "explanation": "Job was killed because it exceeded its wall time limit.",
+        "severity": "error",
+        "action": "Increase --time. Check elapsed vs requested to estimate how much more time is needed.",
+    },
+    "OUT_OF_MEMORY": {
+        "explanation": "Job exceeded its memory limit and was killed by the cgroup OOM handler.",
+        "severity": "error",
+        "action": "Increase --mem. Check MaxRSS from sacct to see actual peak usage and add a 1.5x safety margin.",
+    },
+    "CANCELLED": {
+        "explanation": "Job was cancelled by the user or a system administrator.",
+        "severity": "warning",
+        "action": "If unexpected, check if a dependency job failed (CANCELLED+) or if an admin drained the node.",
+    },
+    "CANCELLED+": {
+        "explanation": "Job was cancelled, and it had already started running before cancellation.",
+        "severity": "warning",
+        "action": "Check if cancelled due to a failed dependency (afterok chain) or manual scancel.",
+    },
+    "NODE_FAIL": {
+        "explanation": "Job terminated because the allocated node went down or became unresponsive.",
+        "severity": "error",
+        "action": "Resubmit the job. This is a cluster infrastructure issue, not a job error. Add --requeue if appropriate.",
+    },
+    "PREEMPTED": {
+        "explanation": "Job was terminated by the scheduler to make room for a higher-priority job.",
+        "severity": "warning",
+        "action": "Resubmit. Consider using a non-preemptable partition or adding --requeue to handle this automatically.",
+    },
+    "BOOT_FAIL": {
+        "explanation": "Job failed because the allocated node could not boot.",
+        "severity": "error",
+        "action": "Resubmit. This is a hardware/infrastructure issue. The scheduler should avoid the bad node.",
+    },
+    "DEADLINE": {
+        "explanation": "Job could not start before its configured deadline.",
+        "severity": "warning",
+        "action": "Remove --deadline or extend it. The cluster was too busy to schedule the job in time.",
+    },
+    "PENDING": {
+        "explanation": "Job is queued and waiting for resources.",
+        "severity": "info",
+        "action": "Check the reason code for why it's waiting (Priority, Resources, QOS limits, etc.).",
+    },
+    "RUNNING": {
+        "explanation": "Job is currently executing.",
+        "severity": "info",
+        "action": "",
+    },
+}
+
+# Pending reason codes -> explanation + suggested action (most common ~30)
+JOB_REASON_INFO: dict[str, dict[str, str]] = {
+    "Priority": {
+        "explanation": "Higher priority jobs are ahead in the queue.",
+        "action": "Wait. Job will start when higher-priority jobs complete.",
+    },
+    "Resources": {
+        "explanation": "Requested resources are not currently available on any node.",
+        "action": "Wait, or reduce resource request (fewer CPUs, less memory, shorter time).",
+    },
+    "Dependency": {
+        "explanation": "Waiting for a dependency job to complete.",
+        "action": "Check the status of the dependency job.",
+    },
+    "DependencyNeverSatisfied": {
+        "explanation": "The dependency job failed, was cancelled, or will never reach the required state.",
+        "action": "Cancel this job and fix the upstream dependency, then resubmit the chain.",
+    },
+    "BeginTime": {
+        "explanation": "Job has a --begin time that has not been reached yet.",
+        "action": "Wait for the scheduled start time, or remove --begin to start immediately.",
+    },
+    "QOSMaxJobsPerUserLimit": {
+        "explanation": "You have reached the maximum number of running jobs allowed by your QOS.",
+        "action": "Wait for running jobs to finish, or cancel unneeded jobs.",
+    },
+    "QOSMaxSubmitJobPerUserLimit": {
+        "explanation": "You have reached the maximum number of submitted (running + pending) jobs for your QOS.",
+        "action": "Wait for jobs to finish or cancel pending jobs before submitting more.",
+    },
+    "QOSMaxCpuPerJobLimit": {
+        "explanation": "Job requests more CPUs than your QOS allows per job.",
+        "action": "Reduce --cpus-per-task or --ntasks to fit within QOS limits.",
+    },
+    "QOSMaxMemoryPerJob": {
+        "explanation": "Job requests more memory than your QOS allows per job.",
+        "action": "Reduce --mem to fit within QOS limits.",
+    },
+    "QOSMaxMemoryPerNode": {
+        "explanation": "Job requests more memory per node than your QOS allows.",
+        "action": "Reduce --mem or spread across more nodes.",
+    },
+    "QOSMaxWallDurationPerJobLimit": {
+        "explanation": "Job requests more wall time than your QOS allows.",
+        "action": "Reduce --time to fit within QOS limits.",
+    },
+    "QOSMaxNodePerJobLimit": {
+        "explanation": "Job requests more nodes than your QOS allows per job.",
+        "action": "Reduce --nodes to fit within QOS limits.",
+    },
+    "QOSGrpCpuLimit": {
+        "explanation": "Your group/account has reached its aggregate CPU limit across all running jobs.",
+        "action": "Wait for other jobs in your group to finish.",
+    },
+    "QOSGrpMemLimit": {
+        "explanation": "Your group/account has reached its aggregate memory limit across all running jobs.",
+        "action": "Wait for other jobs in your group to finish.",
+    },
+    "QOSGrpJobsLimit": {
+        "explanation": "Your group/QOS has reached its maximum simultaneous running jobs.",
+        "action": "Wait for other jobs to finish.",
+    },
+    "QOSNotAllowed": {
+        "explanation": "The QOS is not permitted for your account or partition.",
+        "action": "Use a different partition or contact your admin about QOS access.",
+    },
+    "AssocGrpCpuLimit": {
+        "explanation": "Your account/association has reached its aggregate CPU limit.",
+        "action": "Wait for other jobs under this account to finish.",
+    },
+    "AssocGrpMemLimit": {
+        "explanation": "Your account/association has reached its aggregate memory limit.",
+        "action": "Wait for other jobs under this account to finish.",
+    },
+    "AssocGrpJobsLimit": {
+        "explanation": "Your account has reached its maximum simultaneous running jobs.",
+        "action": "Wait for running jobs to finish or cancel unneeded ones.",
+    },
+    "AssocMaxWallDurationPerJobLimit": {
+        "explanation": "Job requests more wall time than your account allows per job.",
+        "action": "Reduce --time to fit within account limits.",
+    },
+    "PartitionTimeLimit": {
+        "explanation": "Job requests more wall time than the partition allows.",
+        "action": "Reduce --time or use a partition with a higher time limit.",
+    },
+    "PartitionNodeLimit": {
+        "explanation": "Job requests more nodes than the partition allows.",
+        "action": "Reduce --nodes or use a different partition.",
+    },
+    "PartitionDown": {
+        "explanation": "The requested partition is currently down.",
+        "action": "Use a different partition or wait for maintenance to complete.",
+    },
+    "ReqNodeNotAvail": {
+        "explanation": "Required nodes are not currently available (may be reserved for maintenance).",
+        "action": "Remove --nodelist constraint, or wait for the nodes to come back online.",
+    },
+    "NodeDown": {
+        "explanation": "A specifically requested node is down.",
+        "action": "Remove --nodelist constraint and let the scheduler pick an available node.",
+    },
+    "InvalidAccount": {
+        "explanation": "The specified SLURM account does not exist or you don't have access.",
+        "action": "Check your account name with 'sacctmgr show assoc user=$USER'. Fix --account.",
+    },
+    "InvalidQOS": {
+        "explanation": "The specified QOS does not exist.",
+        "action": "Check available QOS with 'sacctmgr show qos'. Fix --qos.",
+    },
+    "BadConstraints": {
+        "explanation": "The job's constraints can never be satisfied by any node in the partition.",
+        "action": "Check --constraint, --gres, and node features. The requested combination may not exist.",
+    },
+    "AccountNotAllowed": {
+        "explanation": "Your account is not allowed to submit to this partition.",
+        "action": "Use a different partition or contact your admin about partition access.",
+    },
+    "JobLaunchFailure": {
+        "explanation": "The job could not be launched (prolog failure, filesystem error, invalid executable).",
+        "action": "Check that the script exists, is executable, and its #! interpreter is valid.",
+    },
+    "JobArrayTaskLimit": {
+        "explanation": "Too many array tasks running simultaneously.",
+        "action": "Wait, or reduce the %N throttle in your --array specification.",
+    },
+    "Licenses": {
+        "explanation": "Waiting for a software license to become available.",
+        "action": "Wait for other jobs using the license to finish.",
+    },
+}
+
+# Signal number -> name and typical SLURM cause
+SIGNAL_INFO: dict[int, dict[str, str]] = {
+    1: {"name": "SIGHUP", "cause": "Terminal hangup or controlling process death."},
+    2: {"name": "SIGINT", "cause": "Interrupt (Ctrl+C or scancel with SIGINT)."},
+    6: {"name": "SIGABRT", "cause": "Process called abort(). Often a C/C++ assertion failure or memory corruption."},
+    9: {"name": "SIGKILL", "cause": "Force killed. Typically kernel OOM killer or SLURM force-kill after timeout grace period."},
+    11: {"name": "SIGSEGV", "cause": "Segmentation fault. Invalid memory access in the program."},
+    13: {"name": "SIGPIPE", "cause": "Broken pipe. Writing to a pipe/socket with no reader."},
+    15: {"name": "SIGTERM", "cause": "Graceful termination. First signal sent by SLURM on timeout or scancel (30s grace before SIGKILL)."},
+    24: {"name": "SIGXCPU", "cause": "CPU time limit exceeded."},
+}
+
 
 @dataclass
 class SlurmConfig:
@@ -827,3 +1039,325 @@ def node_info(
     if limit > 0:
         nodes = nodes[:limit]
     return {"total_matching": total, "shown": len(nodes), "nodes": nodes}
+
+
+# ============================================================================
+# Error code interpreter (Level 1 + Level 2)
+# ============================================================================
+
+
+def _parse_exit_code(exit_code_str: str) -> dict:
+    """Parse sacct ExitCode format 'exit_code:signal' into structured info.
+
+    Args:
+        exit_code_str: String like '0:0', '1:0', '0:9'.
+
+    Returns:
+        Dict with exit_code, signal_number, signal_info, and interpretation.
+    """
+    parts = exit_code_str.strip().split(":")
+    try:
+        exit_code = int(parts[0])
+    except (ValueError, IndexError):
+        exit_code = -1
+    try:
+        signal_num = int(parts[1]) if len(parts) > 1 else 0
+    except ValueError:
+        signal_num = 0
+
+    result = {
+        "raw": exit_code_str,
+        "exit_code": exit_code,
+        "signal_number": signal_num,
+    }
+
+    if signal_num > 0 and signal_num in SIGNAL_INFO:
+        sig = SIGNAL_INFO[signal_num]
+        result["signal_name"] = sig["name"]
+        result["signal_cause"] = sig["cause"]
+    elif signal_num > 0:
+        result["signal_name"] = f"SIG{signal_num}"
+        result["signal_cause"] = f"Killed by signal {signal_num}."
+
+    return result
+
+
+def _parse_rss_to_gb(rss_str: str) -> Optional[float]:
+    """Parse sacct MaxRSS string like '15234K', '4096M', '8G' to GB.
+
+    Args:
+        rss_str: MaxRSS string from sacct.
+
+    Returns:
+        Float GB value, or None if unparseable.
+    """
+    rss_str = rss_str.strip().upper()
+    if not rss_str:
+        return None
+    try:
+        if rss_str.endswith("K"):
+            return float(rss_str[:-1]) / (1024 * 1024)
+        if rss_str.endswith("M"):
+            return float(rss_str[:-1]) / 1024
+        if rss_str.endswith("G"):
+            return float(rss_str[:-1])
+        if rss_str.endswith("T"):
+            return float(rss_str[:-1]) * 1024
+        # Assume bytes
+        return float(rss_str) / (1024 * 1024 * 1024)
+    except ValueError:
+        return None
+
+
+def _compare_resources(sacct_data: dict) -> dict:
+    """Level 2: Compare actual resource usage against what was requested.
+
+    Pulls the requested resources from scontrol and compares with sacct actuals.
+
+    Args:
+        sacct_data: Dict from job_resources() containing state, max_rss, elapsed, etc.
+
+    Returns:
+        Dict with resource_comparison and contextual suggestions.
+    """
+    job_id = sacct_data.get("job_id", "")
+    comparison = {}
+
+    # Get requested resources from scontrol
+    requested = {}
+    result = _run_cmd(["scontrol", "show", "job", job_id], check=False, timeout=10)
+    if result.returncode == 0:
+        for match in re.finditer(r"TimeLimit=(\S+)", result.stdout):
+            requested["time"] = match.group(1)
+        for match in re.finditer(r"MinMemoryNode=(\S+)", result.stdout):
+            requested["mem"] = match.group(1)
+        for match in re.finditer(r"NumCPUs=(\d+)", result.stdout):
+            requested["cpus"] = int(match.group(1))
+    else:
+        # scontrol may not have data for old jobs; try sacct for the submit line
+        sacct_result = _run_cmd(
+            ["sacct", "-j", job_id, "--format=Timelimit,ReqMem,ReqCPUS",
+             "--noheader", "--parsable2"],
+            check=False, timeout=10,
+        )
+        if sacct_result.returncode == 0 and sacct_result.stdout.strip():
+            lines = sacct_result.stdout.strip().split("\n")
+            parts = lines[0].split("|")
+            if len(parts) >= 3:
+                requested["time"] = parts[0].strip()
+                requested["mem"] = parts[1].strip()
+                try:
+                    requested["cpus"] = int(parts[2].strip())
+                except ValueError:
+                    pass
+
+    # Memory comparison
+    actual_rss_gb = _parse_rss_to_gb(sacct_data.get("max_rss", ""))
+    requested_mem = requested.get("mem", "")
+    if actual_rss_gb is not None and requested_mem:
+        requested_mem_gb = _parse_mem_gb(requested_mem)
+        if requested_mem_gb > 0:
+            utilization = actual_rss_gb / requested_mem_gb
+            comparison["memory"] = {
+                "requested": requested_mem,
+                "requested_gb": round(requested_mem_gb, 1),
+                "actual_peak_gb": round(actual_rss_gb, 1),
+                "utilization": round(utilization, 3),
+            }
+            if utilization > 0.9:
+                comparison["memory"]["warning"] = (
+                    f"Peak memory was {utilization:.0%} of allocation. "
+                    f"Recommend increasing to {int(requested_mem_gb * 1.5)}G (1.5x)."
+                )
+
+    # Time comparison
+    elapsed_str = sacct_data.get("elapsed", "")
+    requested_time = requested.get("time", "")
+    if elapsed_str and requested_time:
+        try:
+            elapsed_hours = _parse_time_hours(elapsed_str)
+            requested_hours = _parse_time_hours(requested_time)
+            if requested_hours > 0:
+                time_util = elapsed_hours / requested_hours
+                comparison["time"] = {
+                    "requested": requested_time,
+                    "requested_hours": round(requested_hours, 2),
+                    "elapsed": elapsed_str,
+                    "elapsed_hours": round(elapsed_hours, 2),
+                    "utilization": round(time_util, 3),
+                }
+                if time_util > 0.9:
+                    comparison["time"]["warning"] = (
+                        f"Job used {time_util:.0%} of time limit. "
+                        f"Recommend increasing to {_format_time_hours(requested_hours * 1.5)}."
+                    )
+                elif time_util < 0.1 and elapsed_hours > 0:
+                    comparison["time"]["note"] = (
+                        f"Job used only {time_util:.0%} of time limit. "
+                        f"Consider reducing --time to {_format_time_hours(elapsed_hours * 2)} (2x actual)."
+                    )
+        except ValueError:
+            pass
+
+    # CPU info
+    if requested.get("cpus"):
+        comparison["cpus"] = {"requested": requested["cpus"]}
+
+    return comparison
+
+
+def _format_time_hours(hours: float) -> str:
+    """Format a float hours value as HH:MM:SS or D-HH:MM:SS.
+
+    Args:
+        hours: Time in hours.
+
+    Returns:
+        SLURM-formatted time string.
+    """
+    total_seconds = int(hours * 3600)
+    days = total_seconds // 86400
+    remainder = total_seconds % 86400
+    h = remainder // 3600
+    m = (remainder % 3600) // 60
+    s = remainder % 60
+    if days > 0:
+        return f"{days}-{h:02d}:{m:02d}:{s:02d}"
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def diagnose_job(job_id: str, config: SlurmConfig) -> dict:
+    """Diagnose a SLURM job failure with human-readable explanation and resource comparison.
+
+    Combines Level 1 (static lookup) and Level 2 (resource comparison) analysis.
+
+    Args:
+        job_id: SLURM job ID.
+        config: SLURM config.
+
+    Returns:
+        Dict with state, explanation, action, exit_code_info, resource_comparison, severity.
+    """
+    # Get sacct data
+    resources = job_resources(job_id)
+    if "error" in resources:
+        return {"job_id": job_id, "error": resources["error"]}
+
+    state = resources.get("state", "UNKNOWN")
+    exit_code_str = resources.get("exit_code", "0:0")
+
+    # Level 1: Static state interpretation
+    state_info = JOB_STATE_INFO.get(state, {
+        "explanation": f"Job is in state '{state}'.",
+        "severity": "info",
+        "action": "Check SLURM documentation for this state.",
+    })
+
+    diagnosis: dict = {
+        "job_id": job_id,
+        "job_name": resources.get("name", ""),
+        "state": state,
+        "severity": state_info["severity"],
+        "explanation": state_info["explanation"],
+        "suggested_action": state_info["action"],
+    }
+
+    # Level 1: Parse exit code and signal
+    exit_info = _parse_exit_code(exit_code_str)
+    diagnosis["exit_code_info"] = exit_info
+
+    # Refine explanation based on exit code + signal combination
+    if state == "FAILED" and exit_info["signal_number"] == 9:
+        diagnosis["explanation"] = (
+            "Job was force-killed by SIGKILL. Most likely cause: kernel OOM killer "
+            "(job exceeded memory limit) or SLURM force-kill after timeout grace period."
+        )
+        diagnosis["suggested_action"] = (
+            "Check MaxRSS vs requested memory. If close to limit, increase --mem. "
+            "If job also hit time limit, increase --time."
+        )
+    elif state == "FAILED" and exit_info["signal_number"] == 15:
+        diagnosis["explanation"] = (
+            "Job was terminated by SIGTERM. This is the first signal SLURM sends on "
+            "timeout or scancel. The job had 30 seconds to clean up before SIGKILL."
+        )
+    elif state == "FAILED" and exit_info["signal_number"] == 11:
+        diagnosis["explanation"] = (
+            "Job crashed with a segmentation fault (SIGSEGV). The program accessed "
+            "invalid memory. This is a bug in the code, not a resource issue."
+        )
+        diagnosis["suggested_action"] = (
+            "Debug the program. Check for array out-of-bounds, use-after-free, or "
+            "null pointer dereference. Run with a debugger or address sanitizer."
+        )
+    elif state == "FAILED" and exit_info["exit_code"] == 1 and exit_info["signal_number"] == 0:
+        diagnosis["explanation"] = (
+            "Job script returned exit code 1. This usually means a command in the "
+            "script failed (missing file, bad argument, module load error, etc.)."
+        )
+        diagnosis["suggested_action"] = (
+            "Read the stderr log (slurm_job_logs) for the specific error message. "
+            "Common causes: 'module not found', 'No such file or directory', Python/R errors."
+        )
+    elif state == "FAILED" and exit_info["exit_code"] == 127 and exit_info["signal_number"] == 0:
+        diagnosis["explanation"] = (
+            "Exit code 127: command not found. The script tried to run a program "
+            "that doesn't exist in PATH."
+        )
+        diagnosis["suggested_action"] = (
+            "Check that all required modules are loaded in the script. Verify the "
+            "executable name and PATH. Common fix: add 'module load <tool>' to the script."
+        )
+    elif state == "FAILED" and exit_info["exit_code"] == 126 and exit_info["signal_number"] == 0:
+        diagnosis["explanation"] = (
+            "Exit code 126: permission denied or not executable. The script or a "
+            "command it calls cannot be executed."
+        )
+        diagnosis["suggested_action"] = (
+            "Check file permissions with 'ls -la'. Fix with 'chmod +x <script>'. "
+            "Also check that the #! interpreter line is correct."
+        )
+    elif state == "FAILED" and exit_info["exit_code"] == 2 and exit_info["signal_number"] == 0:
+        diagnosis["explanation"] = (
+            "Exit code 2: typically a usage/syntax error in the executed command."
+        )
+        diagnosis["suggested_action"] = (
+            "Check stderr logs for the specific error. A command was called with "
+            "wrong arguments or invalid syntax."
+        )
+
+    # Level 2: Resource comparison (only for terminal states with accounting data)
+    terminal_states = {"COMPLETED", "FAILED", "TIMEOUT", "OUT_OF_MEMORY",
+                       "CANCELLED", "CANCELLED+", "NODE_FAIL", "PREEMPTED"}
+    if state in terminal_states:
+        comparison = _compare_resources(resources)
+        if comparison:
+            diagnosis["resource_comparison"] = comparison
+
+            # Enrich suggestion with resource data for specific failure modes
+            mem_comp = comparison.get("memory", {})
+            time_comp = comparison.get("time", {})
+
+            if state == "OUT_OF_MEMORY" and mem_comp:
+                actual = mem_comp.get("actual_peak_gb", 0)
+                requested = mem_comp.get("requested_gb", 0)
+                if requested > 0:
+                    suggested = int(requested * 1.5)
+                    diagnosis["suggested_action"] = (
+                        f"Peak memory was {actual:.1f}G out of {requested:.1f}G requested. "
+                        f"Increase --mem to {suggested}G (1.5x)."
+                    )
+
+            if state == "TIMEOUT" and time_comp:
+                elapsed = time_comp.get("elapsed_hours", 0)
+                requested_h = time_comp.get("requested_hours", 0)
+                if requested_h > 0:
+                    suggested_time = _format_time_hours(requested_h * 2)
+                    diagnosis["suggested_action"] = (
+                        f"Job ran for {elapsed:.1f}h and hit the {requested_h:.1f}h limit. "
+                        f"Increase --time to {suggested_time} (2x). "
+                        f"If the job should not take this long, check for infinite loops or "
+                        f"unexpectedly large input data."
+                    )
+
+    return diagnosis
