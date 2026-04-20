@@ -7,6 +7,48 @@ aware validation, job resource profiles Q1-Q4).
 
 ---
 
+## Update — 2026-04-19
+
+The error-code interpreter (`slurm_diagnose_job`, Level 1 + Level 2) has
+shipped. That changes the skill's scope:
+
+- **§3.3 Failure Diagnostician** and **§7 Failure Pattern Database** are now
+  *superseded by the MCP tool*. The pattern matching (state → explanation,
+  signal → cause, MaxRSS vs requested → OOM verdict) lives in `slurm_cli.py`
+  as `JOB_STATE_INFO`, `JOB_REASON_INFO`, `SIGNAL_INFO`, and the
+  `diagnose_job()` function. The skill should **call** `slurm_diagnose_job`,
+  not re-encode that knowledge.
+- The skill's real unfilled gap is **pre-submission intelligence** — nothing
+  today classifies a task, picks a partition, or generates a `#SBATCH`
+  header. That's where this skill earns its keep.
+- **§3.4 Partition Navigator** folds into the Advisor. "Pick a partition" is
+  a step inside "submit this job," not a separate mode.
+
+### Revised scope (phased)
+
+1. **Phase 1 — Resource Advisor + Script Generator.** Classify task
+   (Q1-Q4) → read `slurm://partition-limits` → pick tightest-fit partition →
+   generate `#SBATCH` script → validate with `dry_run` / `test_only` before
+   real submit. Ship this first.
+2. **Phase 2 — Failure-orchestration wrapper (thin).** Call
+   `slurm_diagnose_job`, read the verdict, propose a bumped-resource
+   resubmit script, confirm with user. Only build after Phase 1 gets real
+   use — the tool may already be enough on its own.
+3. **Deferred — dedicated Partition Navigator, Level 3 pattern advisor.**
+   Revisit if Phase 1/2 reveal a gap.
+
+### Key risk
+
+The Q1-Q4 task→resource mapping (§4) becomes a second source of domain
+knowledge alongside CLAUDE.md and `docs/job_resource_profiles.md`. **Drift
+risk**: the skill says 50G for STAR, the profiles doc says 40G, reality
+moves on, the two disagree. **Mitigation**: keep the mapping in one place —
+either the skill prompt reads `docs/job_resource_profiles.md` at activation,
+or we treat the skill as the authoritative copy and delete the duplicate
+from the profiles doc. Decide before building.
+
+---
+
 ## 1. The Core Insight
 
 **MCP tools** = low-level operations ("submit this job", "check that status")
@@ -84,7 +126,15 @@ Produces:
 - Exit code capture + completion marker
 - Uses `slurm_submit_job` tool with `dry_run=true` first for validation
 
-### Mode 3: Failure Diagnostician
+### Mode 3: Failure Diagnostician  **[SUPERSEDED — see Update 2026-04-19]**
+
+**Status**: Replaced by the `slurm_diagnose_job` MCP tool. That tool already
+runs state lookup, exit-code/signal parsing, and requested-vs-actual
+resource comparison. The skill's role here shrinks to: call the tool, read
+the verdict, and (Phase 2) propose a bumped-resource resubmit script.
+
+Original design preserved below for historical context:
+
 **Trigger context**: "Job failed", "OOM", "TIMEOUT", error messages, job IDs
 mentioned with problems.
 
@@ -97,7 +147,7 @@ Skill:
   → Generate fix + resubmit command
 ```
 
-### Mode 4: Partition Navigator
+### Mode 4: Partition Navigator  **[FOLDED INTO MODE 1 — see Update 2026-04-19]**
 **Trigger context**: "What partition should I use?", "Show me available
 resources", choosing where to submit.
 
@@ -279,7 +329,15 @@ exit $EXIT_CODE
 
 ---
 
-## 7. Skill Content: Failure Pattern Database
+## 7. Skill Content: Failure Pattern Database  **[SUPERSEDED — see Update 2026-04-19]**
+
+**Status**: This database is now implemented in `slurm_cli.py` as
+`JOB_STATE_INFO`, `JOB_REASON_INFO`, and `SIGNAL_INFO`, consumed by
+`diagnose_job()`. The skill should call `slurm_diagnose_job` rather than
+re-encode these patterns. Kept below as the historical source material that
+informed the tool's lookup tables.
+
+
 
 ### Exit code patterns
 
@@ -487,11 +545,22 @@ diagnose a failure AND generate a fixed resubmission script).
 
 ---
 
-## 12. Next Steps
+## 12. Next Steps  *(revised 2026-04-19)*
 
-- [ ] Review this design document
-- [ ] Decide on trigger approach (Option A/B/C)
-- [ ] Decide on scope (all modes at once, or phased rollout)
-- [ ] Use skill-creator to build the skill
-- [ ] Write eval cases for testing
-- [ ] Iterate based on real usage
+**Decided:**
+- Trigger approach: **Option C** — one `/slurm` skill, internal routing.
+- Scope: **phased**. Phase 1 (Advisor + Script Generator) first; Phase 2
+  (failure-orchestration wrapper around `slurm_diagnose_job`) only if
+  usage reveals a gap.
+
+**Open decisions (needed before building):**
+- [ ] Confirm skill should always read `slurm://partition-limits` at
+      runtime (no embedded snapshot).
+
+**Build tasks:**
+- [ ] Use skill-creator to scaffold `/slurm` with Phase 1 content only.
+- [ ] Write Phase 1 eval cases (see §11.4 — STAR on 20 samples, dorado
+      basecalling, week-long BEAST run).
+- [ ] Use on real jobs for 1-2 weeks before deciding on Phase 2.
+- [ ] Only then: decide whether Phase 2 adds value over calling
+      `slurm_diagnose_job` directly.
