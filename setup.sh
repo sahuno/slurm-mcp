@@ -140,6 +140,35 @@ if [ ${#USER_PARTITIONS[@]} -gt 0 ]; then
     PARTITION_SOURCE="sacctmgr"
 fi
 
+# ── Hostname-aware preferred default ────────────────────────────────────
+# On MSKCC HPC (login: islogin*, compute: isc*), the cluster default 'cpu'
+# partition is denied for the greenbab account. Prefer 'componc_cpu' as
+# the pre-selected default if it's in the user's allow-list.
+HOSTNAME_SHORT="$(hostname -s 2>/dev/null || hostname)"
+PREFERRED_DEFAULT=""
+case "$HOSTNAME_SHORT" in
+    islogin*|isc*)
+        for p in "${USER_PARTITIONS[@]}"; do
+            if [ "$p" = "componc_cpu" ]; then
+                PREFERRED_DEFAULT="componc_cpu"
+                break
+            fi
+        done
+        ;;
+esac
+
+# If a preferred default is found, reorder USER_PARTITIONS to put it first
+# so it becomes the default selection in the prompts below.
+if [ -n "$PREFERRED_DEFAULT" ]; then
+    REORDERED=("$PREFERRED_DEFAULT")
+    for p in "${USER_PARTITIONS[@]}"; do
+        [ "$p" != "$PREFERRED_DEFAULT" ] && REORDERED+=("$p")
+    done
+    USER_PARTITIONS=("${REORDERED[@]}")
+    echo "  Detected MSKCC cluster (host='$HOSTNAME_SHORT') — defaulting to '$PREFERRED_DEFAULT'."
+    echo "  ('cpu' is the cluster default but is denied for the greenbab account.)"
+fi
+
 # Track whether we fell back to sinfo (determines selection UI)
 SINFO_FALLBACK=false
 
